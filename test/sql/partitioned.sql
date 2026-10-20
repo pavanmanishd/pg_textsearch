@@ -159,6 +159,26 @@ LIMIT 1;
 -- Cleanup
 DROP TABLE subpart_docs CASCADE;
 
+-- Standalone scoring with the parent index name when the parent index's
+-- first child is itself a partitioned index, which has no storage
+CREATE TABLE subpart_first (tenant int, vault int, body text)
+    PARTITION BY LIST (tenant);
+CREATE TABLE subpart_first_t1 PARTITION OF subpart_first
+    FOR VALUES IN (1) PARTITION BY LIST (vault);
+CREATE TABLE subpart_first_t1_v1 PARTITION OF subpart_first_t1
+    FOR VALUES IN (11);
+CREATE INDEX subpart_first_bm25 ON subpart_first USING bm25 (body)
+    WITH (text_config = 'english');
+INSERT INTO subpart_first
+SELECT 1, 11, 'apple orchard number ' || g FROM generate_series(1, 10) g;
+
+SELECT count(*) AS scored
+FROM subpart_first
+WHERE tenant = 1 AND vault = 11
+  AND body <@> to_bm25query('apple', 'subpart_first_bm25') < 0;
+
+DROP TABLE subpart_first;
+
 -- =============================================================================
 -- Test 4: Partition-local BM25 score validation
 --

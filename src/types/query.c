@@ -429,8 +429,9 @@ to_tpquery_text_index(PG_FUNCTION_ARGS)
 }
 
 /*
- * Find the first child index of a partitioned index via pg_inherits.
- * Returns InvalidOid if no children found.
+ * Find the first leaf index under a partitioned index via pg_inherits,
+ * descending through children that are themselves partitioned indexes.
+ * Returns InvalidOid if no leaf index is found.
  */
 static Oid
 find_first_child_index(Oid parent_index_oid)
@@ -440,6 +441,8 @@ find_first_child_index(Oid parent_index_oid)
 	HeapTuple	tuple;
 	ScanKeyData skey;
 	Oid			child_oid = InvalidOid;
+
+	check_stack_depth();
 
 	inhrel = table_open(InheritsRelationId, AccessShareLock);
 
@@ -453,11 +456,16 @@ find_first_child_index(Oid parent_index_oid)
 	scan = systable_beginscan(
 			inhrel, InheritsParentIndexId, true, NULL, 1, &skey);
 
-	tuple = systable_getnext(scan);
-	if (tuple != NULL)
+	while ((tuple = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_inherits inhform = (Form_pg_inherits)GETSTRUCT(tuple);
-		child_oid				 = inhform->inhrelid;
+
+		child_oid = inhform->inhrelid;
+		if (get_rel_relkind(child_oid) == RELKIND_PARTITIONED_INDEX)
+			child_oid = find_first_child_index(child_oid);
+
+		if (OidIsValid(child_oid))
+			break;
 	}
 
 	systable_endscan(scan);
