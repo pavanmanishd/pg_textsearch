@@ -60,10 +60,9 @@ typedef struct TpMergedTerm
  */
 typedef struct TpMergePostingInfo
 {
-	ItemPointerData ctid;		/* CTID for comparison ordering */
-	uint32			old_doc_id; /* Doc ID in source segment */
-	uint16			frequency;	/* Term frequency */
-	uint8			fieldnorm;	/* Encoded fieldnorm (1 byte) */
+	uint32 new_doc_id; /* Doc ID in merged output */
+	uint16 frequency;  /* Term frequency */
+	uint8  fieldnorm;  /* Encoded fieldnorm (1 byte) */
 } TpMergePostingInfo;
 
 /*
@@ -72,9 +71,10 @@ typedef struct TpMergePostingInfo
  */
 typedef struct TpPostingMergeSource
 {
-	TpSegmentReader	  *reader;	  /* Segment reader */
-	TpMergePostingInfo current;	  /* Current posting info */
-	bool			   exhausted; /* No more postings */
+	TpSegmentReader	  *reader;	   /* Segment reader */
+	const uint32	  *old_to_new; /* Source to merged doc ID map */
+	TpMergePostingInfo current;	   /* Current posting info */
+	bool			   exhausted;  /* No more postings */
 
 	/* block iteration state */
 	uint64			skip_index_offset; /* Offset to skip entries */
@@ -131,7 +131,10 @@ extern void tp_validate_merged_terms(TpMergedTerm *terms, uint32 num_terms);
  * Posting merge operations
  */
 extern void posting_source_init(
-		TpPostingMergeSource *ps, TpSegmentReader *reader, TpDictEntry *entry);
+		TpPostingMergeSource *ps,
+		TpSegmentReader		 *reader,
+		TpDictEntry			 *entry,
+		const uint32		 *old_to_new);
 extern void posting_source_init_fast(
 		TpPostingMergeSource *ps, TpSegmentReader *reader, TpDictEntry *entry);
 extern void posting_source_free(TpPostingMergeSource *ps);
@@ -154,6 +157,9 @@ extern void free_merge_doc_mapping(TpMergeDocMapping *mapping);
  * Posting source initialization for a term
  */
 extern TpPostingMergeSource *init_term_posting_sources(
-		TpMergedTerm *term, TpMergeSource *sources, int *num_psources);
+		TpMergedTerm			*term,
+		TpMergeSource			*sources,
+		const TpMergeDocMapping *mapping,
+		int						*num_psources);
 extern TpPostingMergeSource *init_term_posting_sources_fast(
 		TpMergedTerm *term, TpMergeSource *sources, int *num_psources);

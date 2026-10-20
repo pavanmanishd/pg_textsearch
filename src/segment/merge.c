@@ -564,58 +564,32 @@ posting_source_load_block(TpPostingMergeSource *ps)
 }
 
 /*
- * Convert current block posting to output format.
+ * Map the current block posting to its merged doc ID.
  */
 static void
 posting_source_convert_current(TpPostingMergeSource *ps)
 {
 	TpBlockPosting *bp = &ps->block_postings[ps->current_in_block];
-	BlockNumber		page;
-	OffsetNumber	offset;
 
-	/*
-	 * Look up CTID from split arrays (needed for N-way merge ordering).
-	 * Use cached arrays if available, otherwise read from segment.
-	 */
-	if (ps->reader->cached_ctid_pages != NULL &&
-		bp->doc_id < ps->reader->cached_num_docs)
-	{
-		page   = ps->reader->cached_ctid_pages[bp->doc_id];
-		offset = ps->reader->cached_ctid_offsets[bp->doc_id];
-	}
-	else
-	{
-		TpSegmentHeader *header = ps->reader->header;
-
-		tp_segment_read(
-				ps->reader,
-				header->ctid_pages_offset + (bp->doc_id * sizeof(BlockNumber)),
-				&page,
-				sizeof(BlockNumber));
-		tp_segment_read(
-				ps->reader,
-				header->ctid_offsets_offset +
-						(bp->doc_id * sizeof(OffsetNumber)),
-				&offset,
-				sizeof(OffsetNumber));
-	}
-
-	/* Build output posting info */
-	ItemPointerSet(&ps->current.ctid, page, offset);
-	ps->current.old_doc_id = bp->doc_id;
+	ps->current.new_doc_id = ps->old_to_new[bp->doc_id];
 	ps->current.frequency  = bp->frequency;
 	ps->current.fieldnorm  = bp->fieldnorm;
 }
 
 /*
- * Initialize a posting merge source for streaming.
+ * Initialize a posting merge source for streaming.  The source is
+ * positioned on its first posting that survives the merge.
  */
 void
 posting_source_init(
-		TpPostingMergeSource *ps, TpSegmentReader *reader, TpDictEntry *entry)
+		TpPostingMergeSource *ps,
+		TpSegmentReader		 *reader,
+		TpDictEntry			 *entry,
+		const uint32		 *old_to_new)
 {
 	memset(ps, 0, sizeof(TpPostingMergeSource));
 	ps->reader			  = reader;
+	ps->old_to_new		  = old_to_new;
 	ps->skip_index_offset = entry->skip_index_offset;
 	ps->block_count		  = entry->block_count;
 	ps->current_block	  = 0;
@@ -629,6 +603,8 @@ posting_source_init(
 		if (posting_source_load_block(ps))
 		{
 			posting_source_convert_current(ps);
+			if (ps->current.new_doc_id == TP_MERGE_DOC_DEAD)
+				(void)posting_source_advance(ps);
 		}
 		else
 		{
@@ -676,33 +652,19 @@ posting_source_free(TpPostingMergeSource *ps)
 }
 
 /*
- * Advance a posting merge source to the next posting.
+ * Advance a posting merge source to the next posting that survives the
+ * merge, skipping postings of dead documents.
  */
 bool
 posting_source_advance(TpPostingMergeSource *ps)
 {
-	if (ps->exhausted)
-		return false;
-
-	ps->current_in_block++;
-
-	/* Move to next block if current exhausted */
-	while (ps->current_in_block >= ps->skip_entry.doc_count)
+	do
 	{
-		ps->current_block++;
-		if (ps->current_block >= ps->block_count)
-		{
-			ps->exhausted = true;
+		if (!posting_source_advance_fast(ps))
 			return false;
-		}
-		if (!posting_source_load_block(ps))
-		{
-			ps->exhausted = true;
-			return false;
-		}
-	}
+		posting_source_convert_current(ps);
+	} while (ps->current.new_doc_id == TP_MERGE_DOC_DEAD);
 
-	posting_source_convert_current(ps);
 	return true;
 }
 
@@ -739,30 +701,25 @@ posting_source_advance_fast(TpPostingMergeSource *ps)
 }
 
 /*
- * Find the posting source with the smallest current CTID.
+ * Find the posting source with the smallest current merged doc ID.
  * Returns -1 if all sources are exhausted.
  */
 int
 find_min_posting_source(TpPostingMergeSource *sources, int num_sources)
 {
-	int				min_idx = -1;
-	ItemPointerData min_ctid;
-	int				i;
+	int	   min_idx	  = -1;
+	uint32 min_doc_id = 0;
+	int	   i;
 
 	for (i = 0; i < num_sources; i++)
 	{
-		ItemPointerData ctid;
-
 		if (sources[i].exhausted)
 			continue;
 
-		/* Copy to avoid unaligned access from packed struct */
-		memcpy(&ctid, &sources[i].current.ctid, sizeof(ItemPointerData));
-
-		if (min_idx < 0 || ItemPointerCompare(&ctid, &min_ctid) < 0)
+		if (min_idx < 0 || sources[i].current.new_doc_id < min_doc_id)
 		{
-			min_idx = i;
-			memcpy(&min_ctid, &ctid, sizeof(ItemPointerData));
+			min_idx	   = i;
+			min_doc_id = sources[i].current.new_doc_id;
 		}
 	}
 
@@ -1053,7 +1010,10 @@ free_merge_doc_mapping(TpMergeDocMapping *mapping)
  */
 TpPostingMergeSource *
 init_term_posting_sources(
-		TpMergedTerm *term, TpMergeSource *sources, int *num_psources)
+		TpMergedTerm			*term,
+		TpMergeSource			*sources,
+		const TpMergeDocMapping *mapping,
+		int						*num_psources)
 {
 	TpPostingMergeSource *psources;
 	uint32				  i;
@@ -1066,7 +1026,11 @@ init_term_posting_sources(
 		TpTermSegmentRef *ref	 = &term->segment_refs[i];
 		TpMergeSource	 *source = &sources[ref->segment_idx];
 
-		posting_source_init(&psources[i], source->reader, &ref->entry);
+		posting_source_init(
+				&psources[i],
+				source->reader,
+				&ref->entry,
+				mapping->old_to_new[ref->segment_idx]);
 	}
 
 	return psources;
@@ -1334,8 +1298,8 @@ write_merged_segment_to_sink(
 	 * time and write immediately.
 	 *
 	 * When disjoint_sources is true, drain sources sequentially
-	 * (source 0 fully, then source 1, etc.) without CTID lookups.
-	 * Otherwise, use N-way CTID-comparison merge.
+	 * (source 0 fully, then source 1, etc.).  Otherwise, use an
+	 * N-way merge on merged doc IDs.
 	 */
 	for (i = 0; i < num_terms; i++)
 	{
@@ -1405,10 +1369,12 @@ write_merged_segment_to_sink(
 		else
 		{
 			/*
-			 * Standard N-way merge: compare CTIDs across sources.
+			 * N-way merge on merged doc IDs.  build_merged_docmap
+			 * assigns them in each source's doc ID order, so every
+			 * source's surviving postings stay sorted after mapping.
 			 */
 			psources = init_term_posting_sources(
-					&terms[i], sources, &num_psources);
+					&terms[i], sources, &doc_mapping, &num_psources);
 
 			while (true)
 			{
@@ -1416,25 +1382,13 @@ write_merged_segment_to_sink(
 				if (min_idx < 0)
 					break;
 
-				{
-					int src_idx = terms[i].segment_refs[min_idx].segment_idx;
-					uint32 old_doc_id = psources[min_idx].current.old_doc_id;
-					uint32 new_id =
-							doc_mapping.old_to_new[src_idx][old_doc_id];
-
-					if (new_id == TP_MERGE_DOC_DEAD)
-					{
-						posting_source_advance(&psources[min_idx]);
-						continue;
-					}
-
-					block_buf[block_count].doc_id = new_id;
-					block_buf[block_count].frequency =
-							psources[min_idx].current.frequency;
-					block_buf[block_count].fieldnorm =
-							psources[min_idx].current.fieldnorm;
-					block_buf[block_count].reserved = 0;
-				}
+				block_buf[block_count].doc_id =
+						psources[min_idx].current.new_doc_id;
+				block_buf[block_count].frequency =
+						psources[min_idx].current.frequency;
+				block_buf[block_count].fieldnorm =
+						psources[min_idx].current.fieldnorm;
+				block_buf[block_count].reserved = 0;
 				block_count++;
 				doc_count++;
 
