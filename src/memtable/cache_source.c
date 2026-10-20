@@ -373,6 +373,7 @@ tp_memtable_cache_source_create_internal(
 	TpMemtable			  *memtable;
 	TpLocalIndexState	  *lock_state_to_release;
 	bool				   matched_snapshot = false;
+	bool				   endpoint_moved	= false;
 
 	(void)query_terms;
 	(void)query_term_count;
@@ -496,12 +497,26 @@ tp_memtable_cache_source_create_internal(
 							"(oid=%u)",
 							state->shared->index_oid)));
 
-		cs->string_table = tp_string_table_attach(
-				state->dsa, memtable->string_hash_handle);
-		cs->doclength_table = tp_doclength_table_attach(
-				state->dsa, memtable->doc_lengths_handle);
+		/*
+		 * Deferred reclaim prevents endpoint reuse while the executor's heap
+		 * snapshot lives. Freeze cache catch-up until this source is closed.
+		 */
+		endpoint_moved = snapshot != NULL &&
+						 (memtable->cursor_next_blkno !=
+								  snapshot->tail_blkno ||
+						  memtable->cursor_next_off !=
+								  snapshot->tail_free_offset);
 
-		compute_corpus_totals(cs, &cs->base.total_docs, &cs->base.total_len);
+		if (!endpoint_moved)
+		{
+			cs->string_table = tp_string_table_attach(
+					state->dsa, memtable->string_hash_handle);
+			cs->doclength_table = tp_doclength_table_attach(
+					state->dsa, memtable->doc_lengths_handle);
+
+			compute_corpus_totals(
+					cs, &cs->base.total_docs, &cs->base.total_len);
+		}
 	}
 	PG_CATCH();
 	{
@@ -520,13 +535,7 @@ tp_memtable_cache_source_create_internal(
 	}
 	PG_END_TRY();
 
-	/*
-	 * Deferred reclaim prevents endpoint reuse while the executor's heap
-	 * snapshot lives. Freeze cache catch-up until this source is closed.
-	 */
-	if (snapshot != NULL &&
-		(memtable->cursor_next_blkno != snapshot->tail_blkno ||
-		 memtable->cursor_next_off != snapshot->tail_free_offset))
+	if (endpoint_moved)
 	{
 		cache_close((TpDataSource *)cs);
 		return NULL;

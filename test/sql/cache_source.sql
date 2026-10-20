@@ -78,6 +78,62 @@ SELECT id, body
 
 RESET pg_textsearch.memtable_cache_enabled;
 
+-- ---------- retained endpoint after the cache moves on ----------
+-- A cursor keeps the memtable endpoint its scan started at.  An
+-- INSERT and a ranked query in the same transaction advance the
+-- cache past that endpoint, so the cursor's later scoring passes
+-- cannot use the cache and read the bounded chain instead.  The
+-- cursor must still return exactly the rows of its endpoint.
+CREATE TABLE cache_source_snap (id int, body text);
+CREATE INDEX cache_source_snap_idx ON cache_source_snap
+    USING bm25 (body) WITH (text_config = 'english');
+SET pg_textsearch.memtable_pages_threshold = 0;
+SET pg_textsearch.bulk_load_threshold = 0;
+INSERT INTO cache_source_snap
+SELECT g, 'apple filler ' || g
+  FROM generate_series(1, 2000) g;
+SET pg_textsearch.default_limit = 10;
+
+CREATE FUNCTION cache_source_snap_ids() RETURNS int[]
+LANGUAGE plpgsql AS $$
+DECLARE
+    c CURSOR FOR
+        SELECT id FROM cache_source_snap
+         WHERE id % 100 = 0
+         ORDER BY body <@> to_bm25query('apple', 'cache_source_snap_idx');
+    r record;
+    ids int[] := '{}';
+BEGIN
+    OPEN c;
+    FETCH c INTO r;
+    ids := ids || r.id;
+    INSERT INTO cache_source_snap VALUES (2100, 'apple late');
+    PERFORM count(*) FROM (
+        SELECT id FROM cache_source_snap
+         ORDER BY body <@> to_bm25query('apple', 'cache_source_snap_idx')
+         LIMIT 5) s;
+    LOOP
+        FETCH c INTO r;
+        EXIT WHEN NOT FOUND;
+        ids := ids || r.id;
+    END LOOP;
+    CLOSE c;
+    RETURN ids;
+END
+$$;
+
+SELECT array_length(ids, 1) AS fetched,
+       ARRAY(SELECT unnest(ids) ORDER BY 1)
+           = ARRAY(SELECT g * 100 FROM generate_series(1, 20) g)
+           AS endpoint_rows
+  FROM cache_source_snap_ids() ids;
+
+DROP FUNCTION cache_source_snap_ids();
+DROP TABLE cache_source_snap;
+RESET pg_textsearch.default_limit;
+RESET pg_textsearch.bulk_load_threshold;
+RESET pg_textsearch.memtable_pages_threshold;
+
 DROP INDEX cache_source_idx;
 DROP TABLE cache_source_t;
 DROP EXTENSION pg_textsearch CASCADE;
