@@ -416,7 +416,8 @@ SELECT bm25_level_counts('docs_idx'::regclass);
 ```
 
 `bm25_force_merge()` runs one bounded best-effort pass over eligible adjacent
-segments; oversized or otherwise uncombinable segments may remain.
+segments; oversized or otherwise uncombinable segments may remain. A lone
+segment with no dead documents is not rewritten.
 `bm25_compact()` processes all eligible levels, while `bm25_compact_step()`
 processes at most one pass.
 

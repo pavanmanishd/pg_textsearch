@@ -803,10 +803,16 @@ tp_plan_is_noop(
 	if (plan->num_batches != plan->num_sources)
 		return false;
 
+	/*
+	 * Moving the only segment to another level frees no slot that a spill
+	 * or merge needs, so size placement alone does not justify rewriting
+	 * it.
+	 */
 	for (uint32 i = 0; i < plan->num_batches; i++)
 	{
 		if (plan->batches[i].source_count != 1 ||
-			plan->batches[i].output_level != plan->sources[i].source_level)
+			(plan->num_sources > 1 &&
+			 plan->batches[i].output_level != plan->sources[i].source_level))
 			return false;
 	}
 

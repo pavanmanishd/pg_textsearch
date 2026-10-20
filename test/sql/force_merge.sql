@@ -304,6 +304,8 @@ DECLARE
     deep_before text := bm25_summarize_index('force_tier_deep_idx');
     mixed_before text := bm25_summarize_index('force_tier_mixed_idx');
     memtable_before text := bm25_summarize_index('force_tier_memtable_idx');
+    single_pending_before bigint :=
+        bm25_pending_free_pages('force_tier_single_idx');
     single_summary text;
     deep_summary text;
     mixed_summary text;
@@ -319,10 +321,16 @@ BEGIN
     mixed_summary := bm25_summarize_index('force_tier_mixed_idx');
     memtable_summary := bm25_summarize_index('force_tier_memtable_idx');
 
-    IF regexp_count(single_summary, 'L[0-7] Segment [0-9]+:') >
-       regexp_count(single_before, 'L[0-7] Segment [0-9]+:') THEN
-        RAISE EXCEPTION 'force merge increased segment count: before %, after %',
-                        single_before, single_summary;
+    -- A lone segment with no dead documents has nothing to combine, so
+    -- force merge must leave it in place rather than rewrite it only to
+    -- change its level.
+    IF regexp_count(single_summary, 'L[0-7] Segment [0-9]+:') <> 1
+       OR single_summary !~ 'L1 Segment 1:'
+       OR bm25_pending_free_pages('force_tier_single_idx') <>
+          single_pending_before THEN
+        RAISE EXCEPTION
+            'force merge rewrote a clean singleton: before %, after %',
+            single_before, single_summary;
     END IF;
     IF regexp_count(deep_summary, 'L[0-7] Segment [0-9]+:') >
        regexp_count(deep_before, 'L[0-7] Segment [0-9]+:') THEN
@@ -389,7 +397,7 @@ DECLARE
     summary text := bm25_summarize_index('force_tier_single_idx');
 BEGIN
     IF regexp_count(summary, 'L[0-7] Segment [0-9]+:') <> 1
-       OR summary !~ 'L0 Segment 1:'
+       OR summary !~ 'L1 Segment 1:'
        OR summary !~ E'Memtable:\n  terms: 0\n  documents: 1' THEN
         RAISE EXCEPTION 'termless singleton layout was not constructed: %',
                         summary;

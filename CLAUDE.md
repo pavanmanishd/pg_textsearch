@@ -288,7 +288,8 @@ See [RELEASING.md](RELEASING.md) for release instructions.
   `pg_textsearch.max_segment_size`. It does **not** guarantee a single
   segment: large indexes may intentionally retain several immutable
   segments, and an existing segment that already exceeds the budget
-  remains an uncombinable singleton. Published sources stay immutable
+  remains an uncombinable singleton. A lone segment with no dead
+  documents is not rewritten. Published sources stay immutable
   while replacements are built; displaced pages enter deferred reclaim
   (see #380) rather than becoming immediately reusable. Waits for index
   maintenance when another session holds it.
