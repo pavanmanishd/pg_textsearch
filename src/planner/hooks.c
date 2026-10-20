@@ -1472,6 +1472,44 @@ get_index_table_oid(Oid index_oid)
 }
 
 /*
+ * Check whether a BM25 index path orders by a bm25query that names another
+ * index usable on the same relation.  A plan scanning this index would be
+ * rejected by validate_indexscan_explicit_index, so the path must lose to
+ * the path of the named index.
+ */
+bool
+tp_indexpath_names_other_index(IndexPath *path)
+{
+	BM25OidCache oids;
+	TpQuery		*tpquery;
+	Oid			 named_index_oid;
+	ListCell	*lc;
+
+	if (!get_bm25_oids(&oids))
+		return false;
+
+	tpquery = find_tpquery_in_list(path->indexorderbys, &oids);
+	if (tpquery == NULL || !tpquery_is_explicit_index(tpquery))
+		return false;
+
+	named_index_oid = get_tpquery_index_oid(tpquery);
+	if (named_index_oid == path->indexinfo->indexoid ||
+		is_child_partition_index(named_index_oid, path->indexinfo->indexoid))
+		return false;
+
+	foreach (lc, path->indexinfo->rel->indexlist)
+	{
+		IndexOptInfo *index = lfirst_node(IndexOptInfo, lc);
+
+		if (index->indexoid == named_index_oid ||
+			is_child_partition_index(named_index_oid, index->indexoid))
+			return true;
+	}
+
+	return false;
+}
+
+/*
  * Check if an index is a BM25 index.
  */
 static bool

@@ -23,6 +23,7 @@
 #include "constants.h"
 #include "index/metapage.h"
 #include "planner/cost.h"
+#include "planner/hooks.h"
 
 static bool
 tp_boolean_get_constant_query(IndexPath *path, TSQuery *query)
@@ -128,6 +129,19 @@ tp_costestimate(
 	 */
 	if ((!has_orderby && !has_boolean) || (has_orderby && has_boolean) ||
 		(has_boolean && list_length(path->indexclauses) != 1))
+	{
+		tp_disable_index_path(
+				path,
+				indexStartupCost,
+				indexTotalCost,
+				indexSelectivity,
+				indexCorrelation,
+				indexPages);
+		return;
+	}
+
+	/* Lose to the path of the index named in to_bm25query() */
+	if (has_orderby && tp_indexpath_names_other_index(path))
 	{
 		tp_disable_index_path(
 				path,

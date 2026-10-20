@@ -77,6 +77,48 @@ WHERE category_id = 1
 ORDER BY score
 LIMIT 10;
 
+-- The same with the index name as a parameter. A custom plan folds
+-- to_bm25query() to a constant after the explicit index was collected, so
+-- index costing has to choose the named index.
+SET plan_cache_mode = force_custom_plan;
+PREPARE explicit_by_index(text, text) AS
+SELECT ROUND((content <@> to_bm25query($1, $2))::numeric, 4) AS score
+FROM multi_index_test
+ORDER BY content <@> to_bm25query($1, $2)
+LIMIT 2;
+EXPLAIN (COSTS OFF)
+EXECUTE explicit_by_index('ressources', 'content_idx_french');
+EXECUTE explicit_by_index('ressources', 'content_idx_french');
+EXPLAIN (COSTS OFF)
+EXECUTE explicit_by_index('ressources', 'content_idx_simple');
+EXECUTE explicit_by_index('ressources', 'content_idx_simple');
+DEALLOCATE explicit_by_index;
+
+-- Two indexes on a partitioned table: the partition indexes of the named
+-- parent index must be scanned
+CREATE TABLE multi_index_part (id int, content text) PARTITION BY RANGE (id);
+CREATE TABLE multi_index_part_1 PARTITION OF multi_index_part
+    FOR VALUES FROM (0) TO (1000);
+INSERT INTO multi_index_part
+SELECT i, 'Les ressources humaines gèrent les employés'
+FROM generate_series(1, 200) i;
+CREATE INDEX multi_part_french ON multi_index_part USING bm25 (content)
+    WITH (text_config = 'french');
+CREATE INDEX multi_part_simple ON multi_index_part USING bm25 (content)
+    WITH (text_config = 'simple');
+ANALYZE multi_index_part;
+PREPARE explicit_part_by_index(text, text) AS
+SELECT id FROM multi_index_part
+ORDER BY content <@> to_bm25query($1, $2)
+LIMIT 2;
+EXPLAIN (COSTS OFF)
+EXECUTE explicit_part_by_index('ressources', 'multi_part_french');
+EXPLAIN (COSTS OFF)
+EXECUTE explicit_part_by_index('ressources', 'multi_part_simple');
+DEALLOCATE explicit_part_by_index;
+DROP TABLE multi_index_part;
+RESET plan_cache_mode;
+
 -- Positive test: without an explicit index, implicit resolution still
 -- works. All matching rows share the same text, so the BM25 scores are
 -- deterministic even though the tied tuple ids (and which tied index is

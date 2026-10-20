@@ -92,6 +92,94 @@ LIMIT 10;
          Filter: (category_id = 1)
 (4 rows)
 
+-- The same with the index name as a parameter. A custom plan folds
+-- to_bm25query() to a constant after the explicit index was collected, so
+-- index costing has to choose the named index.
+SET plan_cache_mode = force_custom_plan;
+PREPARE explicit_by_index(text, text) AS
+SELECT ROUND((content <@> to_bm25query($1, $2))::numeric, 4) AS score
+FROM multi_index_test
+ORDER BY content <@> to_bm25query($1, $2)
+LIMIT 2;
+EXPLAIN (COSTS OFF)
+EXECUTE explicit_by_index('ressources', 'content_idx_french');
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using content_idx_french on multi_index_test
+         Order By: (content <@> 'content_idx_french:ressources'::bm25query)
+(3 rows)
+
+EXECUTE explicit_by_index('ressources', 'content_idx_french');
+  score  
+---------
+ -0.0005
+ -0.0005
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+EXECUTE explicit_by_index('ressources', 'content_idx_simple');
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using content_idx_simple on multi_index_test
+         Order By: (content <@> 'content_idx_simple:ressources'::bm25query)
+(3 rows)
+
+EXECUTE explicit_by_index('ressources', 'content_idx_simple');
+  score  
+---------
+ -0.0005
+ -0.0005
+(2 rows)
+
+DEALLOCATE explicit_by_index;
+-- Two indexes on a partitioned table: the partition indexes of the named
+-- parent index must be scanned
+CREATE TABLE multi_index_part (id int, content text) PARTITION BY RANGE (id);
+CREATE TABLE multi_index_part_1 PARTITION OF multi_index_part
+    FOR VALUES FROM (0) TO (1000);
+INSERT INTO multi_index_part
+SELECT i, 'Les ressources humaines gèrent les employés'
+FROM generate_series(1, 200) i;
+CREATE INDEX multi_part_french ON multi_index_part USING bm25 (content)
+    WITH (text_config = 'french');
+NOTICE:  BM25 index build started for relation multi_index_part_1_content_idx
+NOTICE:  Using text search configuration: french
+NOTICE:  Using index options: k1=1.20, b=0.75
+NOTICE:  BM25 index build completed: 200 documents, avg_length=6.00
+CREATE INDEX multi_part_simple ON multi_index_part USING bm25 (content)
+    WITH (text_config = 'simple');
+NOTICE:  BM25 index build started for relation multi_index_part_1_content_idx1
+NOTICE:  Using text search configuration: simple
+NOTICE:  Using index options: k1=1.20, b=0.75
+NOTICE:  BM25 index build completed: 200 documents, avg_length=6.00
+ANALYZE multi_index_part;
+PREPARE explicit_part_by_index(text, text) AS
+SELECT id FROM multi_index_part
+ORDER BY content <@> to_bm25query($1, $2)
+LIMIT 2;
+EXPLAIN (COSTS OFF)
+EXECUTE explicit_part_by_index('ressources', 'multi_part_french');
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using multi_index_part_1_content_idx on multi_index_part_1 multi_index_part
+         Order By: (content <@> 'multi_part_french:ressources'::bm25query)
+(3 rows)
+
+EXPLAIN (COSTS OFF)
+EXECUTE explicit_part_by_index('ressources', 'multi_part_simple');
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using multi_index_part_1_content_idx1 on multi_index_part_1 multi_index_part
+         Order By: (content <@> 'multi_part_simple:ressources'::bm25query)
+(3 rows)
+
+DEALLOCATE explicit_part_by_index;
+DROP TABLE multi_index_part;
+RESET plan_cache_mode;
 -- Positive test: without an explicit index, implicit resolution still
 -- works. All matching rows share the same text, so the BM25 scores are
 -- deterministic even though the tied tuple ids (and which tied index is
