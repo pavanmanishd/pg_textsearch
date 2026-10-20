@@ -5058,7 +5058,7 @@ tp_process_utility_impl(
 
 			if (readOnlyTree)
 			{
-				pstmt		 = copyObject(pstmt);
+				pstmt		 = (PlannedStmt *)copyObjectImpl(pstmt);
 				parsetree	 = pstmt->utilityStmt;
 				stmt		 = castNode(IndexStmt, parsetree);
 				readOnlyTree = false;

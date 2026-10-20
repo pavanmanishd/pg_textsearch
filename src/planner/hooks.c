@@ -672,7 +672,7 @@ create_opexpr(Oid opno, Node *left, Node *right, Oid inputcollid, int location)
 	new_opexpr->opretset	 = false;
 	new_opexpr->opcollid	 = InvalidOid;
 	new_opexpr->inputcollid	 = inputcollid;
-	new_opexpr->args		 = list_make2(copyObject(left), right);
+	new_opexpr->args		 = list_make2((Node *)copyObjectImpl(left), right);
 	new_opexpr->location	 = location;
 
 	return new_opexpr;
@@ -1598,7 +1598,7 @@ collect_explicit_indexes_walker(
 								else
 								{
 									req->attnum = 0;
-									req->expr	= copyObject(left);
+									req->expr	= (Node *)copyObjectImpl(left);
 								}
 								context->requirements =
 										lappend(context->requirements, req);
