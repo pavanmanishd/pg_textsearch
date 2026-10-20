@@ -16,6 +16,7 @@
 #include <access/xact.h>
 #include <catalog/indexing.h>
 #include <catalog/namespace.h>
+#include <catalog/partition.h>
 #include <catalog/pg_am.h>
 #include <catalog/pg_extension.h>
 #include <catalog/pg_index.h>
@@ -264,8 +265,33 @@ get_bm25_oids(BM25OidCache *cache)
 }
 
 /*
+ * Map a column of a partitioned table to the same column of one of its
+ * partitions, at any depth.  Attribute numbers can differ between the two,
+ * so the column is matched by name.  Returns InvalidAttrNumber if
+ * partition_relid is not a partition of relid.
+ */
+static AttrNumber
+partition_attnum(Oid relid, AttrNumber attnum, Oid partition_relid)
+{
+	char *attname;
+
+	if (!get_rel_relispartition(partition_relid))
+		return InvalidAttrNumber;
+
+	if (!list_member_oid(get_partition_ancestors(partition_relid), relid))
+		return InvalidAttrNumber;
+
+	attname = get_attname(relid, attnum, true);
+	if (attname == NULL)
+		return InvalidAttrNumber;
+
+	return get_attnum(partition_relid, attname);
+}
+
+/*
  * Check if an index is on a specific column of a table.
- * Returns true if the index is on the given table and column.
+ * Returns true if the index is on the given table and column, or on that
+ * column of one of the table's partitions.
  */
 static bool
 index_is_on_column(Oid index_oid, Oid relid, AttrNumber attnum)
@@ -280,8 +306,10 @@ index_is_on_column(Oid index_oid, Oid relid, AttrNumber attnum)
 
 	idx_form = (Form_pg_index)GETSTRUCT(idx_tuple);
 
-	/* Check if index is on the correct table */
-	if (idx_form->indrelid == relid)
+	if (idx_form->indrelid != relid)
+		attnum = partition_attnum(relid, attnum, idx_form->indrelid);
+
+	if (attnum != InvalidAttrNumber)
 	{
 		/* Check if index is on the correct column */
 		int nkeys = idx_form->indnatts;

@@ -344,6 +344,76 @@ FROM (
     LIMIT 5
 ) t;
 
+-- =============================================================================
+-- Test 6: Literal query naming a leaf partition index through the parent
+--
+-- A leaf partition index is on the parent's column through the partition
+-- hierarchy, at any depth, even when the leaf's attribute numbers differ
+-- from the parent's.
+-- =============================================================================
+
+CREATE TABLE leaf_named (tenant int NOT NULL, id int NOT NULL,
+                         title text, body text NOT NULL)
+    PARTITION BY LIST (tenant);
+CREATE TABLE leaf_named_t1 PARTITION OF leaf_named FOR VALUES IN (1);
+CREATE TABLE leaf_named_t2 PARTITION OF leaf_named FOR VALUES IN (2)
+    PARTITION BY LIST (id);
+-- Different column order, so body has another attnum than on the parent
+CREATE TABLE leaf_named_t2_a (body text NOT NULL, title text,
+                              id int NOT NULL, tenant int NOT NULL);
+ALTER TABLE leaf_named_t2 ATTACH PARTITION leaf_named_t2_a
+    FOR VALUES IN (1, 2);
+CREATE INDEX leaf_named_bm25 ON leaf_named USING bm25 (body)
+    WITH (text_config = 'english');
+CREATE INDEX leaf_named_t1_title_idx ON leaf_named_t1 USING bm25 (title)
+    WITH (text_config = 'english');
+INSERT INTO leaf_named VALUES
+    (1, 1, 'apple', 'apple pie recipe'),
+    (1, 2, 'banana', 'banana bread'),
+    (2, 1, 'apple', 'apple orchard'),
+    (2, 2, 'cherry', 'cherry tart');
+
+SELECT id,
+       ROUND((body <@> to_bm25query('apple',
+             'leaf_named_t1_body_idx'))::numeric, 4) AS score
+FROM leaf_named WHERE tenant = 1
+ORDER BY body <@> to_bm25query('apple', 'leaf_named_t1_body_idx')
+LIMIT 1;
+
+SELECT id,
+       ROUND((body <@> to_bm25query('apple',
+             'leaf_named_t2_a_body_idx'))::numeric, 4) AS score
+FROM leaf_named WHERE tenant = 2
+ORDER BY body <@> to_bm25query('apple', 'leaf_named_t2_a_body_idx')
+LIMIT 1;
+
+SELECT id,
+       ROUND((body <@> to_bm25query('apple',
+             'leaf_named_t2_a_body_idx'))::numeric, 4) AS score
+FROM leaf_named_t2
+ORDER BY body <@> to_bm25query('apple', 'leaf_named_t2_a_body_idx')
+LIMIT 1;
+
+-- The leaf index of another partition cannot scan this one
+SELECT id FROM leaf_named WHERE tenant = 2
+ORDER BY body <@> to_bm25query('apple', 'leaf_named_t1_body_idx')
+LIMIT 1;
+
+-- A leaf index on another column, or on an unrelated table, is rejected
+SELECT id FROM leaf_named WHERE tenant = 1
+ORDER BY body <@> to_bm25query('apple', 'leaf_named_t1_title_idx')
+LIMIT 1;
+
+CREATE TABLE leaf_named_other (body text);
+CREATE INDEX leaf_named_other_idx ON leaf_named_other USING bm25 (body)
+    WITH (text_config = 'english');
+SELECT id FROM leaf_named WHERE tenant = 1
+ORDER BY body <@> to_bm25query('apple', 'leaf_named_other_idx')
+LIMIT 1;
+
+DROP TABLE leaf_named_other;
+DROP TABLE leaf_named;
+
 -- Cleanup
 SET enable_seqscan = on;
 DROP TABLE partitioned_scoring CASCADE;
