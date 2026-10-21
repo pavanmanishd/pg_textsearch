@@ -101,6 +101,7 @@ typedef struct TpSegmentReader
 
 	/* Cached page map loaded from page index */
 	BlockNumber *page_map;
+	bool		 page_map_borrowed; /* page_map is owned by the cache */
 	uint32		 num_pages;
 	BlockNumber	 nblocks; /* Relation size for validation */
 

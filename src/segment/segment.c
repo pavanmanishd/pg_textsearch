@@ -10,6 +10,7 @@
 #include <access/generic_xlog.h>
 #include <access/hash.h>
 #include <access/table.h>
+#include <access/xact.h>
 #include <access/xloginsert.h>
 #include <catalog/namespace.h>
 #include <catalog/storage.h>
@@ -22,6 +23,7 @@
 #include <storage/indexfsm.h>
 #include <storage/lock.h>
 #include <unistd.h>
+#include <utils/hsearch.h>
 #include <utils/lsyscache.h>
 #include <utils/memutils.h>
 #include <utils/rel.h>
@@ -56,11 +58,150 @@ tp_segment_log_dirty_buffer(Relation index, Buffer buffer)
 }
 
 /*
- * Note: We previously had a global page map cache here, but it was removed
- * due to race conditions when multiple backends accessed it concurrently.
- * Since segments are small and page maps are not frequently re-read in the
- * same backend, the performance impact of removing the cache is minimal.
+ * Backend-local cache of segment page maps.
+ *
+ * A published segment's page map never changes, but its root block can be
+ * reclaimed and reused by a later segment.  Every write of a WAL-logged
+ * page gives it a new LSN, so an entry is reused only while the root page
+ * still carries the LSN it had when the map was loaded.  Relations that
+ * skip WAL are never cached.
+ *
+ * Readers borrow cached arrays, so a superseded array is freed only at
+ * transaction end, once no reader can still use it.
  */
+#define TP_PAGE_MAP_CACHE_BUDGET ((Size)32 * 1024 * 1024)
+
+typedef struct TpPageMapCacheKey
+{
+	RelFileLocator locator;
+	BlockNumber	   root_block;
+} TpPageMapCacheKey;
+
+typedef struct TpPageMapCacheEntry
+{
+	TpPageMapCacheKey key;
+	XLogRecPtr		  root_lsn;
+	uint32			  num_pages;
+	BlockNumber		 *page_map;
+} TpPageMapCacheEntry;
+
+static MemoryContext tp_page_map_context	 = NULL;
+static HTAB			*tp_page_map_cache		 = NULL;
+static Size			 tp_page_map_cache_bytes = 0;
+static bool			 tp_page_map_cache_full	 = false;
+
+static void
+tp_page_map_cache_xact_callback(
+		XactEvent event, void *arg pg_attribute_unused())
+{
+	switch (event)
+	{
+	case XACT_EVENT_COMMIT:
+	case XACT_EVENT_PARALLEL_COMMIT:
+	case XACT_EVENT_ABORT:
+	case XACT_EVENT_PARALLEL_ABORT:
+	case XACT_EVENT_PREPARE:
+		if (tp_page_map_cache_full)
+		{
+			MemoryContextReset(tp_page_map_context);
+			tp_page_map_cache		= NULL;
+			tp_page_map_cache_bytes = 0;
+			tp_page_map_cache_full	= false;
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static TpPageMapCacheKey
+tp_page_map_cache_key(Relation index, BlockNumber root_block)
+{
+	TpPageMapCacheKey key;
+
+	memset(&key, 0, sizeof(key));
+	key.locator	   = index->rd_locator;
+	key.root_block = root_block;
+	return key;
+}
+
+static BlockNumber *
+tp_page_map_cache_lookup(
+		Relation	index,
+		BlockNumber root_block,
+		XLogRecPtr	root_lsn,
+		uint32		num_pages)
+{
+	TpPageMapCacheKey	 key;
+	TpPageMapCacheEntry *entry;
+
+	if (tp_page_map_cache == NULL || root_lsn == InvalidXLogRecPtr)
+		return NULL;
+
+	key	  = tp_page_map_cache_key(index, root_block);
+	entry = hash_search(tp_page_map_cache, &key, HASH_FIND, NULL);
+	if (entry == NULL || entry->root_lsn != root_lsn ||
+		entry->num_pages != num_pages)
+		return NULL;
+
+	return entry->page_map;
+}
+
+static void
+tp_page_map_cache_store(
+		Relation		   index,
+		BlockNumber		   root_block,
+		XLogRecPtr		   root_lsn,
+		const BlockNumber *page_map,
+		uint32			   num_pages)
+{
+	Size				 size = (Size)num_pages * sizeof(BlockNumber);
+	TpPageMapCacheKey	 key;
+	TpPageMapCacheEntry *entry;
+	BlockNumber			*copy;
+
+	if (root_lsn == InvalidXLogRecPtr || num_pages == 0)
+		return;
+	if (size > TP_PAGE_MAP_CACHE_BUDGET - tp_page_map_cache_bytes)
+	{
+		tp_page_map_cache_full = true;
+		return;
+	}
+
+	if (tp_page_map_context == NULL)
+	{
+		tp_page_map_context = AllocSetContextCreate(
+				TopMemoryContext,
+				"pg_textsearch segment page maps",
+				ALLOCSET_DEFAULT_SIZES);
+		RegisterXactCallback(tp_page_map_cache_xact_callback, NULL);
+	}
+
+	if (tp_page_map_cache == NULL)
+	{
+		HASHCTL ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize		  = sizeof(TpPageMapCacheKey);
+		ctl.entrysize	  = sizeof(TpPageMapCacheEntry);
+		ctl.hcxt		  = tp_page_map_context;
+		tp_page_map_cache = hash_create(
+				"pg_textsearch segment page maps",
+				64,
+				&ctl,
+				HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	copy = MemoryContextAlloc(tp_page_map_context, size);
+	memcpy(copy, page_map, size);
+
+	key				 = tp_page_map_cache_key(index, root_block);
+	entry			 = hash_search(tp_page_map_cache, &key, HASH_ENTER, NULL);
+	entry->root_lsn	 = root_lsn;
+	entry->num_pages = num_pages;
+	entry->page_map	 = copy;
+	tp_page_map_cache_bytes += size;
+}
 
 /*
  * Version-aware dictionary entry reader.
@@ -162,6 +303,7 @@ tp_segment_open_internal(
 	uint32				pages_loaded = 0;
 	uint32				i;
 	BlockNumber			nblocks;
+	XLogRecPtr			root_lsn;
 
 	/*
 	 * Validate root_block is within the relation. In Postgres, blocks are
@@ -314,6 +456,9 @@ tp_segment_open_internal(
 	/* Get page index location from header */
 	page_index_block = header->page_index;
 
+	root_lsn = RelationNeedsWAL(index) ? BufferGetLSNAtomic(header_buf)
+									   : InvalidXLogRecPtr;
+
 	/* Keep header buffer for later use */
 	reader->header_buffer = header_buf;
 	LockBuffer(
@@ -322,8 +467,15 @@ tp_segment_open_internal(
 	if (header_only)
 		return reader;
 
-	/* Always load page map from disk - no caching due to concurrency issues */
-	reader->page_map = palloc(sizeof(BlockNumber) * reader->num_pages);
+	reader->page_map = tp_page_map_cache_lookup(
+			index, root_block, root_lsn, reader->num_pages);
+	if (reader->page_map != NULL)
+	{
+		reader->page_map_borrowed = true;
+		pages_loaded			  = reader->num_pages;
+	}
+	else
+		reader->page_map = palloc(sizeof(BlockNumber) * reader->num_pages);
 
 	/* Read page index chain to build page map */
 	while (page_index_block != InvalidBlockNumber &&
@@ -411,6 +563,14 @@ tp_segment_open_internal(
 						 pages_loaded),
 				 errhint("The index may be corrupted and should be rebuilt")));
 	}
+
+	if (!reader->page_map_borrowed)
+		tp_page_map_cache_store(
+				index,
+				root_block,
+				root_lsn,
+				reader->page_map,
+				reader->num_pages);
 
 	/*
 	 * Optionally preload CTID arrays into memory for result lookup.
@@ -719,7 +879,7 @@ tp_segment_close(TpSegmentReader *reader)
 		if (BufferIsValid(reader->header_buffer))
 			ReleaseBuffer(reader->header_buffer);
 
-		if (reader->page_map)
+		if (reader->page_map && !reader->page_map_borrowed)
 			pfree(reader->page_map);
 	}
 
